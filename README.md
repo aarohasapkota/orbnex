@@ -5,9 +5,7 @@ A nexus of orbs. tmux command center — every window is a 3×2 grid of six term
 ## Install
 
 ```sh
-brew install tmux
-ln -s "$PWD/orbnex" ~/.local/bin/orbnex
-mkdir -p ~/.config/orbnex && ln -s "$PWD/orbnex.conf" ~/.config/orbnex/orbnex.conf
+curl -fsSL https://raw.githubusercontent.com/aarohasapkota/orbnex/main/install.sh | bash
 ```
 
 ## Use

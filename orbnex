@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════
+#  ORBNEX — a nexus of orbs
+#  Run `orbnex` inside any project folder, the way you'd run `code`.
+#  Spawns (or re-attaches to) a tmux nexus for that project:
+#  every window is a 3x2 grid of six orbs.
+# ═══════════════════════════════════════════════════════════════
+set -euo pipefail
+
+SOCKET="orbnex"
+CONF="$HOME/.config/orbnex/orbnex.conf"
+
+CYAN=$'\033[1;36m'; VIOLET=$'\033[1;35m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+
+t() { tmux -L "$SOCKET" -f "$CONF" "$@"; }
+
+session_name_for() {
+  basename "$1" | sed 's/[^a-zA-Z0-9_-]/-/g'
+}
+
+# The grid's fingerprint: 3 orbs on top, 3 on the bottom.
+# tmux rescales this to whatever size the window actually is.
+GRID_LAYOUT="89ff,300x80,0,0[300x40,0,0{101x40,0,0,0,98x40,102,0,2,99x40,201,0,3},300x39,0,41{101x39,0,41,1,98x39,102,41,4,99x39,201,41,5}]"
+
+# Build the six-orb grid in a target window
+grid() {
+  local target="$1" dir="$2" i
+  for i in 1 2 3 4 5; do
+    t split-window -t "$target" -c "$dir"
+    t select-layout -t "$target" tiled
+  done
+  t select-layout -t "$target" "$GRID_LAYOUT"
+  t select-pane -t "${target}.1"
+}
+
+launch() {
+  local dir name
+  dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || { echo "orbnex: no such directory: $1" >&2; exit 1; }
+  name="$(session_name_for "$dir")"
+
+  if ! t has-session -t "=$name" 2>/dev/null; then
+    echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} igniting nexus ${VIOLET}$name${RESET}"
+    t new-session -d -s "$name" -c "$dir" -n nexus
+    grid "$name:1" "$dir"
+  else
+    echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} re-linking to nexus ${VIOLET}$name${RESET}"
+  fi
+
+  if [ -n "${TMUX:-}" ]; then
+    # Already inside a tmux client on this server: jump, don't nest
+    t switch-client -t "=$name"
+  else
+    t attach-session -t "=$name"
+  fi
+}
+
+case "${1:-}" in
+  ls|list)
+    echo "${CYAN}◉ ORBNEX${RESET} ${DIM}· active nexuses${RESET}"
+    t ls 2>/dev/null || echo "${DIM}  none — the nexus sleeps${RESET}"
+    ;;
+  kill)
+    name="${2:-$(session_name_for "$PWD")}"
+    t kill-session -t "=$name" 2>/dev/null \
+      && echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} nexus ${VIOLET}$name${RESET} powered down" \
+      || echo "orbnex: no nexus named '$name'" >&2
+    ;;
+  killall)
+    t kill-server 2>/dev/null || true
+    echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} all orbs dark"
+    ;;
+  help|-h|--help)
+    cat <<EOF
+${CYAN}◉ ORBNEX${RESET} — a nexus of orbs
+
+${VIOLET}usage${RESET}
+  orbnex            ignite/re-link a nexus for the current folder
+  orbnex <dir>      ignite/re-link a nexus for <dir>
+  orbnex ls         list active nexuses
+  orbnex kill [n]   power down a nexus (default: current folder's)
+  orbnex killall    power down everything
+  orbnex help       this
+
+${VIOLET}inside the nexus${RESET}  (prefix = Ctrl-b)
+  prefix c          new window — fresh grid of 6 orbs
+  prefix C          new window — one big orb
+  prefix n / p      next / previous window     Opt+1..9 jumps direct
+  Opt+arrows        move between orbs (no prefix)
+  prefix z          zoom an orb fullscreen / restore
+  prefix g          snap window back into the grid
+  prefix d          detach — the nexus keeps running
+  prefix | or -     extra manual splits
+  prefix r          reload config
+EOF
+    ;;
+  *)
+    launch "${1:-}"
+    ;;
+esac

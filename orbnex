@@ -2,15 +2,20 @@
 # ═══════════════════════════════════════════════════════════════
 #  ORBNEX — a nexus of orbs
 #  Run `orbnex` inside any project folder, the way you'd run `code`.
-#  Spawns (or re-attaches to) a tmux nexus for that project:
-#  every window is a 3x2 grid of six orbs.
+#  Every window (tab) is a grid of six orbs. The grid adapts to
+#  the screen: 3x2 on wide terminals, 2x3 on narrow, stacked on tiny.
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
 SOCKET="orbnex"
 CONF="$HOME/.config/orbnex/orbnex.conf"
+case "$0" in
+  /*) SELF="$0" ;;
+  *)  SELF="$(command -v orbnex 2>/dev/null || echo "$HOME/.local/bin/orbnex")" ;;
+esac
 
-CYAN=$'\033[1;36m'; VIOLET=$'\033[1;35m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+CYAN=$'\033[1;36m'; VIOLET=$'\033[1;35m'; ORANGE=$'\033[38;2;255;140;0m'
+DIM=$'\033[2m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 
 t() { tmux -L "$SOCKET" -f "$CONF" "$@"; }
 
@@ -18,29 +23,188 @@ session_name_for() {
   basename "$1" | sed 's/[^a-zA-Z0-9_-]/-/g'
 }
 
-# The grid's fingerprint: 3 orbs on top, 3 on the bottom.
-# tmux rescales this to whatever size the window actually is.
-GRID_LAYOUT="89ff,300x80,0,0[300x40,0,0{101x40,0,0,0,98x40,102,0,2,99x40,201,0,3},300x39,0,41{101x39,0,41,1,98x39,102,41,4,99x39,201,41,5}]"
+current_session() {
+  if [ -n "${TMUX_PANE:-}" ]; then
+    t display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null && return 0
+  fi
+  t display-message -p '#{session_name}' 2>/dev/null && return 0
+  t list-sessions -F '#{session_name}' 2>/dev/null | head -1
+}
+
+# ─── The grid ─────────────────────────────────────────────────
+# 3x2 fingerprint (3 orbs top, 3 bottom); tmux rescales it to fit.
+GRID_3X2="89ff,300x80,0,0[300x40,0,0{101x40,0,0,0,98x40,102,0,2,99x40,201,0,3},300x39,0,41{101x39,0,41,1,98x39,102,41,4,99x39,201,41,5}]"
+
+# Pick the layout that fits the window's current size
+apply_grid_layout() {
+  local win="$1" w
+  w=$(t display-message -p -t "$win" '#{window_width}') || return 0
+  if [ "$w" -ge 135 ]; then
+    t select-layout -t "$win" "$GRID_3X2" 2>/dev/null || t select-layout -t "$win" tiled
+  elif [ "$w" -ge 50 ]; then
+    t select-layout -t "$win" tiled 2>/dev/null || true
+  else
+    t select-layout -t "$win" even-vertical 2>/dev/null || true
+  fi
+}
 
 # Build the six-orb grid in a target window
 grid() {
   local target="$1" dir="$2" i
   for i in 1 2 3 4 5; do
-    t split-window -t "$target" -c "$dir"
-    t select-layout -t "$target" tiled
+    t split-window -d -t "$target" -c "$dir" 2>/dev/null || true
+    t select-layout -t "$target" tiled 2>/dev/null || true
   done
-  t select-layout -t "$target" "$GRID_LAYOUT"
-  t select-pane -t "${target}.1"
+  apply_grid_layout "$target"
+  t select-pane -t "${target}.1" 2>/dev/null || true
 }
 
+# Re-fit every 6-orb window to its current size (or one window if given)
+reflow() {
+  local only="${1:-}" win panes
+  if [ -n "$only" ]; then
+    panes=$(t display-message -p -t "$only" '#{window_panes}') || return 0
+    if [ "$panes" = 6 ]; then
+      t set-option -w -t "$only" @orbnex_grid 1
+      apply_grid_layout "$only"
+    fi
+    return 0
+  fi
+  t list-windows -a -F '#{window_id} #{window_panes}' 2>/dev/null |
+  while read -r win panes; do
+    [ "$panes" = 6 ] || continue
+    [ "$(t show-options -wqv -t "$win" @orbnex_grid 2>/dev/null)" = 1 ] || continue
+    apply_grid_layout "$win"
+  done
+}
+
+# ─── Tabs ─────────────────────────────────────────────────────
+# New tab = new window with a fresh 6-orb grid in the session's folder
+newtab() {
+  local ses="${1:-}" dir win
+  [ -n "$ses" ] || ses=$(current_session) || { echo "orbnex: no nexus running" >&2; exit 1; }
+  dir=$(t display-message -p -t "$ses:" '#{session_path}' 2>/dev/null || true)
+  [ -d "$dir" ] || dir=$(t display-message -p -t "$ses:" '#{pane_current_path}')
+  t set-option -g @orbnex_busy 1
+  win=$(t new-window -t "$ses:" -c "$dir" -n nexus -P -F '#{window_id}')
+  t set-option -w -t "$win" @orbnex_grid 1
+  grid "$win" "$dir"
+  t set-option -g @orbnex_busy 0
+  dock_sync
+}
+
+# ─── Tab manager dock (left/right sidebar, follows the active tab) ──
+dock_cmd() {
+  local side="${1:-toggle}" ses cur
+  ses="${2:-}"; [ -n "$ses" ] || ses=$(current_session) || { echo "orbnex: no nexus running" >&2; exit 1; }
+  cur=$(t show-options -qv -t "$ses" @orbnex_dock 2>/dev/null || true); [ -n "$cur" ] || cur=off
+  case "$side" in
+    toggle)
+      if [ "$cur" = off ]; then
+        side=$(t show-options -qv -t "$ses" @orbnex_dock_side 2>/dev/null || true)
+        [ -n "$side" ] || side=right
+      else
+        side=off
+      fi ;;
+    left|right|off) ;;
+    *) echo "orbnex: dock left|right|off|toggle" >&2; exit 1 ;;
+  esac
+  t set-option -t "$ses" @orbnex_dock "$side"
+  [ "$side" = off ] || t set-option -t "$ses" @orbnex_dock_side "$side"
+  dock_sync
+}
+
+# Keep exactly one dock pane, always in the active tab of each session
+dock_sync() {
+  [ "$(t show-options -gqv @orbnex_busy 2>/dev/null)" = 1 ] && return 0
+  local ses mode active p w have
+  t list-sessions -F '#{session_name}' 2>/dev/null |
+  while read -r ses; do
+    mode=$(t show-options -qv -t "$ses" @orbnex_dock 2>/dev/null || true); [ -n "$mode" ] || mode=off
+    active=$(t display-message -p -t "$ses:" '#{window_id}')
+    t list-panes -s -t "$ses" -F '#{pane_id} #{window_id}' 2>/dev/null |
+    while read -r p w; do
+      [ "$(t show-options -pqv -t "$p" @orbnex_is_dock 2>/dev/null)" = 1 ] || continue
+      if [ "$mode" = off ] || [ "$w" != "$active" ]; then
+        t kill-pane -t "$p" 2>/dev/null || true
+      fi
+    done
+    if [ "$mode" != off ]; then
+      have=0
+      for p in $(t list-panes -t "$active" -F '#{pane_id}'); do
+        [ "$(t show-options -pqv -t "$p" @orbnex_is_dock 2>/dev/null)" = 1 ] && have=1
+      done
+      if [ "$have" = 0 ]; then
+        if [ "$mode" = left ]; then
+          p=$(t split-window -d -f -h -b -l 30 -t "$active" -P -F '#{pane_id}' "exec \"$SELF\" dockui")
+        else
+          p=$(t split-window -d -f -h -l 30 -t "$active" -P -F '#{pane_id}' "exec \"$SELF\" dockui")
+        fi
+        t set-option -p -t "$p" @orbnex_is_dock 1
+        t select-pane -t "$p" -T tabs
+      fi
+    fi
+  done
+  reflow
+}
+
+# The UI that runs inside the dock pane
+dockui() {
+  local ses act idx name panes key
+  ses=$(t display-message -p -t "${TMUX_PANE:-}" '#{session_name}')
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true' EXIT
+  while :; do
+    printf '\033[2J\033[H'
+    printf '\n %s◉ TABS%s %s%s%s\n' "$ORANGE$BOLD" "$RESET" "$DIM" "$ses" "$RESET"
+    printf ' %s────────────────────%s\n' "$DIM" "$RESET"
+    t list-windows -t "$ses" -F '#{window_active}|#{window_index}|#{window_name}|#{window_panes}' 2>/dev/null |
+    while IFS='|' read -r act idx name panes; do
+      if [ "$act" = 1 ]; then
+        printf '  %s◉ %s·%s%s %s(%s)%s\n' "$ORANGE$BOLD" "$idx" "$name" "$RESET" "$DIM" "$panes" "$RESET"
+      else
+        printf '  %s○ %s·%s (%s)%s\n' "$DIM" "$idx" "$name" "$panes" "$RESET"
+      fi
+    done
+    printf ' %s────────────────────%s\n' "$DIM" "$RESET"
+    printf '  %s1-9%s go   %sn%s new tab\n' "$CYAN" "$RESET" "$CYAN" "$RESET"
+    printf '  %sx%s close  %sq%s hide\n' "$CYAN" "$RESET" "$CYAN" "$RESET"
+    key=""
+    IFS= read -rsn1 -t 2 key || continue
+    case "$key" in
+      [1-9]) t select-window -t "$ses:$key" 2>/dev/null || true ;;
+      n) "$SELF" newtab "$ses" >/dev/null 2>&1 || true ;;
+      x) t kill-window -t "$ses:" 2>/dev/null || true ;;
+      q) "$SELF" dock off "$ses" >/dev/null 2>&1 || true ;;
+    esac
+  done
+}
+
+# ─── Tab strip (status bar) position ──────────────────────────
+bar_cmd() {
+  local pos="${1:-toggle}" cur
+  cur=$(t show-options -gqv status-position 2>/dev/null || true); [ -n "$cur" ] || cur=top
+  if [ "$pos" = toggle ]; then
+    if [ "$cur" = top ]; then pos=bottom; else pos=top; fi
+  fi
+  case "$pos" in
+    top|bottom) t set-option -g status-position "$pos" ;;
+    *) echo "orbnex: bar top|bottom|toggle" >&2; exit 1 ;;
+  esac
+}
+
+# ─── Launch ───────────────────────────────────────────────────
 launch() {
-  local dir name
+  local dir name cols lines
   dir="$(cd "${1:-$PWD}" 2>/dev/null && pwd)" || { echo "orbnex: no such directory: $1" >&2; exit 1; }
   name="$(session_name_for "$dir")"
 
   if ! t has-session -t "=$name" 2>/dev/null; then
     echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} igniting nexus ${VIOLET}$name${RESET}"
-    t new-session -d -s "$name" -c "$dir" -n nexus
+    cols=$( { [ -t 1 ] && tput cols; } 2>/dev/null || echo 300 )
+    lines=$( { [ -t 1 ] && tput lines; } 2>/dev/null || echo 80 )
+    t new-session -d -s "$name" -c "$dir" -n nexus -x "$cols" -y "$lines"
+    t set-option -w -t "$name:1" @orbnex_grid 1
     grid "$name:1" "$dir"
   else
     echo "${CYAN}◉ ORBNEX${RESET} ${DIM}·${RESET} re-linking to nexus ${VIOLET}$name${RESET}"
@@ -59,6 +223,12 @@ case "${1:-}" in
     echo "${CYAN}◉ ORBNEX${RESET} ${DIM}· active nexuses${RESET}"
     t ls 2>/dev/null || echo "${DIM}  none — the nexus sleeps${RESET}"
     ;;
+  newtab)    newtab "${2:-}" ;;
+  reflow)    reflow "${2:-}" ;;
+  dock)      dock_cmd "${2:-toggle}" "${3:-}" ;;
+  dock-sync) dock_sync ;;
+  dockui)    dockui ;;
+  bar)       bar_cmd "${2:-toggle}" ;;
   kill)
     name="${2:-$(session_name_for "$PWD")}"
     t kill-session -t "=$name" 2>/dev/null \
@@ -74,23 +244,33 @@ case "${1:-}" in
 ${CYAN}◉ ORBNEX${RESET} — a nexus of orbs
 
 ${VIOLET}usage${RESET}
-  orbnex            ignite/re-link a nexus for the current folder
-  orbnex <dir>      ignite/re-link a nexus for <dir>
-  orbnex ls         list active nexuses
-  orbnex kill [n]   power down a nexus (default: current folder's)
-  orbnex killall    power down everything
-  orbnex help       this
+  orbnex              ignite/re-link a nexus for the current folder
+  orbnex <dir>        ignite/re-link a nexus for <dir>
+  orbnex ls           list active nexuses
+  orbnex newtab       open a new tab (6-orb grid, same folder)
+  orbnex dock left|right|off|toggle   tab-manager sidebar
+  orbnex bar top|bottom|toggle        move the tab strip
+  orbnex kill [n]     power down a nexus (default: current folder's)
+  orbnex killall      power down everything
+  orbnex help         this
 
 ${VIOLET}inside the nexus${RESET}  (prefix = Ctrl-b)
-  prefix c          new window — fresh grid of 6 orbs
-  prefix C          new window — one big orb
-  prefix n / p      next / previous window     Opt+1..9 jumps direct
+  prefix c          new tab — fresh grid of 6 orbs (adapts to screen size)
+  prefix C          new tab — one big orb
+  prefix t          toggle the tab-manager sidebar
+  prefix b          flip the tab strip top/bottom
+  prefix w          tab overview (choose-tree)
+  prefix n / p      next / previous tab       Opt+1..9 jumps direct
   Opt+arrows        move between orbs (no prefix)
   prefix z          zoom an orb fullscreen / restore
-  prefix g          snap window back into the grid
+  prefix g          re-fit the grid to the screen
   prefix d          detach — the nexus keeps running
   prefix | or -     extra manual splits
   prefix r          reload config
+
+${VIOLET}mouse${RESET}
+  click a tab       switch to it          middle-click a tab   close it
+  click ＋ (right side of strip)          new tab
 EOF
     ;;
   *)
